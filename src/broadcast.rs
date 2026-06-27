@@ -57,17 +57,17 @@ impl BroadcastGroup {
                 })
                 .unwrap()
         };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = kanal::unbounded_async();
         let sink = sender.clone();
         let awareness_sub = awareness.on_update(move |_awareness, e, _origin| {
             let changed = e.all_changes();
-            if tx.send(changed).is_err() {
+            if tx.try_send(changed).is_err() {
                 tracing::warn!("failed to send awareness update");
             }
         });
 
         let awareness_updater = tokio::task::spawn(async move {
-            while let Some(changed_clients) = rx.recv().await {
+            while let Ok(changed_clients) = rx.recv().await {
                 if let Some(awareness) = awareness_c.upgrade() {
                     match awareness.update_with_clients(changed_clients) {
                         Ok(update) => {
@@ -115,7 +115,7 @@ impl BroadcastGroup {
     pub fn subscribe<Sink, Stream, E>(&self, sink: Arc<Mutex<Sink>>, stream: Stream) -> Subscription
     where
         Sink: SinkExt<Vec<u8>> + Send + Sync + Unpin + 'static,
-        Stream: StreamExt<Item = Result<Vec<u8>, E>> + Send + Sync + Unpin + 'static,
+        Stream: StreamExt<Item = Result<Vec<u8>, E>> + Send + Unpin + 'static,
         <Sink as futures_util::Sink<Vec<u8>>>::Error: std::error::Error + Send + Sync,
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -139,7 +139,7 @@ impl BroadcastGroup {
     ) -> Subscription
     where
         Sink: SinkExt<Vec<u8>> + Send + Sync + Unpin + 'static,
-        Stream: StreamExt<Item = Result<Vec<u8>, E>> + Send + Sync + Unpin + 'static,
+        Stream: StreamExt<Item = Result<Vec<u8>, E>> + Send + Unpin + 'static,
         <Sink as futures_util::Sink<Vec<u8>>>::Error: std::error::Error + Send + Sync,
         E: std::error::Error + Send + Sync + 'static,
         P: Protocol + Send + Sync + 'static,

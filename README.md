@@ -1,136 +1,133 @@
-# Yrs web socket connections for Axum
+# yrs-engineio
 
-[![build](https://github.com/vagmi/yrs-axum/actions/workflows/build.yml/badge.svg)](https://github.com/vagmi/yrs-axum/actions/workflows/build.yml)
-[![docs](https://docs.rs/yrs-axum/badge.svg)](https://docs.rs/yrs-axum)
-[![crates.io](https://img.shields.io/crates/v/yrs-axum)](https://crates.io/crates/yrs-axum)
+Yrs synchronization protocol over [Engine.IO](https://github.com/socketio/engine.io),
+built on top of [`engineioxide`](https://crates.io/crates/engineioxide).
 
-This library is an extension over [Yjs](https://yjs.dev)/[Yrs](https://github.com/y-crdt/y-crdt) Conflict-Free Replicated Data Types (CRDT) 
-message exchange protocol. It provides an utilities connect with Yjs web socket provider using the
-[axum](https://github.com/tokio-rs/axum) server.
+This library is an extension over [Yjs](https://yjs.dev)/[Yrs](https://github.com/y-crdt/y-crdt)
+Conflict-Free Replicated Data Types (CRDT) message exchange protocol. It wires a
+[`yrs::sync::Awareness`](https://docs.rs/yrs) document to Engine.IO connections so
+that document updates and awareness are gossiped between every peer collaborating
+on the same logical document.
 
-### Demo
+It was inspired by — and is a near-direct port of —
+[`yrs-axum`](https://github.com/vagmi/yrs-axum). The y-sync core (`BroadcastGroup`,
+`conn`, custom `Protocol` support) is unchanged; only the transport layer differs:
+instead of an Axum raw WebSocket, connections are driven by `engineioxide` sockets
+through the `EngineSink` / `EngineStream` adapters.
 
-A working demo can be seen under [examples](./examples) subfolder. It integrates this library API with 
-Code Mirror 6, enhancing it with collaborative rich text document editing capabilities. This work is based of 
-the excellent [y-warp](https://github.com/y-crdt/yrs-warp) library.
+## Why Engine.IO
 
-### Example
+Engine.IO negotiates a transport (HTTP long-polling → WebSocket) and transparently
+falls back when WebSockets are blocked by a proxy, which a raw WebSocket cannot do.
+It also exposes a single connection endpoint, so the room/document is selected via a
+handshake query parameter rather than the URL path.
 
-In order to gossip updates between different web socket connection from the clients collaborating over the same logical document, a broadcast group can be used:
+## Transport adapters
+
+The broadcast core is transport-agnostic: `BroadcastGroup::subscribe` accepts any
+`Sink<Vec<u8>>` + `Stream<Item = Result<Vec<u8>, E>>` pair. This crate provides two
+adapters over an `engineioxide` socket:
+
+- **`EngineSink<D>`** — wraps an `Arc<Socket<D>>` and implements `futures::Sink<Vec<u8>>`,
+  emitting each frame as an Engine.IO binary message via `socket.emit_binary`.
+- **`EngineStream`** — wraps a [`kanal`](https://crates.io/crates/kanal)
+  `AsyncReceiver<Vec<u8>>` and implements `futures::Stream`. Inbound binary frames are
+  forwarded into the channel from the Engine.IO message handler; the stream ends when
+  the channel closes (i.e. on disconnect).
+
+## Example
+
+Implement `engineioxide`'s `EngineIoHandler`. On connect, create a channel, store the
+sender so inbound frames can be pushed into it, and spawn a task that subscribes the
+connection to a shared `BroadcastGroup`:
 
 ```rust
-use axum::{
-    extract::{ws::{WebSocket, WebSocketUpgrade}, State},
-    response::IntoResponse,
-    routing::get,
-    Router
-};
+use std::sync::Arc;
+use engineioxide::handler::EngineIoHandler;
+use engineioxide::socket::{DisconnectReason, Socket};
+use tokio::sync::Mutex;
+use yrs::sync::Awareness;
+use yrs::{Doc, Transact};
+use yrs_engineio::broadcast::BroadcastGroup;
+use yrs_engineio::engineio::{EngineSink, EngineStream};
 
-#[tokio::main]
-async fn main() {
-    // We're using a single static document shared among all the peers.
-    let awareness = Arc::new(RwLock::new(Awareness::new(Doc::new())));
-
-    // open a broadcast group that listens to awareness and document updates
-    // and has a pending message buffer of up to 32 updates
-    let bcast = Arc::new(BroadcastGroup::new(awareness, 32).await);
-
-    // Create a router with our WebSocket handler
-    let app = Router::new()
-        .route("/my-room", get(ws_handler))
-        .with_state(bcast);
-
-    // Start the server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
-    println!("Listening on {}", &listener.local_addr().unwrap());
-    
-    axum::serve(listener, app).await.unwrap();
+#[derive(Default)]
+struct Data {
+    inbox: parking_lot::Mutex<Option<kanal::AsyncSender<Vec<u8>>>>,
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(bcast): State<Arc<BroadcastGroup>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| peer(socket, bcast))
+#[derive(Clone)]
+struct Handler {
+    // A real server resolves the BroadcastGroup per room from the handshake query.
+    group: Arc<BroadcastGroup>,
 }
 
-async fn peer(ws: WebSocket, bcast: Arc<BroadcastGroup>) {
-    let (sink, stream) = ws.split();
-    let sink = Arc::new(Mutex::new(AxumSink::from(sink)));
-    let stream = AxumStream::from(stream);
-    let sub = bcast.subscribe(sink, stream);
-    match sub.completed().await {
-        Ok(_) => println!("broadcasting for channel finished successfully"),
-        Err(e) => eprintln!("broadcasting for channel finished abruptly: {}", e),
+impl EngineIoHandler for Handler {
+    type Data = Data;
+
+    fn on_connect(self: Arc<Self>, socket: Arc<Socket<Data>>) {
+        let (tx, rx) = kanal::unbounded_async();
+        *socket.data.inbox.lock() = Some(tx);
+
+        let group = self.group.clone();
+        tokio::spawn(async move {
+            let sink = Arc::new(Mutex::new(EngineSink(socket.clone())));
+            let stream = EngineStream::new(rx);
+            let sub = group.subscribe(sink, stream);
+            let _ = sub.completed().await;
+            socket.close(DisconnectReason::TransportClose);
+        });
     }
+
+    fn on_disconnect(&self, socket: Arc<Socket<Data>>, _reason: DisconnectReason) {
+        let _ = socket.data.inbox.lock().take();
+    }
+
+    fn on_message(self: &Arc<Self>, _msg: engineioxide::Str, _socket: Arc<Socket<Data>>) {}
+
+    fn on_binary(self: &Arc<Self>, data: bytes::Bytes, socket: Arc<Socket<Data>>) {
+        if let Some(tx) = socket.data.inbox.lock().as_ref() {
+            let _ = tx.try_send(data.to_vec());
+        }
+    }
+}
+
+async fn make_group() -> Arc<BroadcastGroup> {
+    let awareness = Arc::new(Awareness::new(Doc::new()));
+    // pending message buffer of up to 64 updates
+    Arc::new(BroadcastGroup::new(awareness, 64).await)
 }
 ```
 
+Mount the handler with `engineioxide::service::EngineIoService` (configuring `req_path`
+to your endpoint) and serve it, e.g. via `axum`'s `route_service`.
+
 ## Custom protocol extensions
 
-[y-sync](https://crates.io/crates/y-sync) protocol enables to extend it's own protocol, and yrs-axum supports this as well.
-This can be done by implementing your own protocol, eg.:
+The [y-sync](https://crates.io/crates/yrs) protocol can be extended, and this crate
+supports it via `BroadcastGroup::subscribe_with`:
 
 ```rust
-use y_sync::sync::Protocol;
+use yrs::sync::{Awareness, Error, Message, Protocol};
 
 struct EchoProtocol;
 impl Protocol for EchoProtocol {
     fn missing_handle(
         &self,
-        awareness: &mut Awareness,
+        _awareness: &Awareness,
         tag: u8,
         data: Vec<u8>,
     ) -> Result<Option<Message>, Error> {
-        // all messages prefixed with tags unknown to y-sync protocol
-        // will be echo-ed back to the sender
+        // messages with tags unknown to the y-sync protocol are echoed back
         Ok(Some(Message::Custom(tag, data)))
     }
 }
 
-async fn peer(ws: WebSocket, awareness: AwarenessRef) {
-    //.. later in code subscribe with custom protocol parameter
-    let sub = bcast.subscribe_with(sink, stream, EchoProtocol);
-    // .. rest of the code
-}
+// ... later, when registering a connection:
+// let sub = group.subscribe_with(sink, stream, EchoProtocol);
 ```
 
-## y-webrtc and signaling service
+## License
 
-Additionally to performing it's role as a [y-websocket](https://docs.yjs.dev/ecosystem/connection-provider/y-websocket) 
-server, `yrs-axum` also provides a signaling server implementation used by [y-webrtc](https://github.com/yjs/y-webrtc)
-clients to exchange information necessary to connect WebRTC peers together and make them subscribe/unsubscribe from specific rooms.
-
-```rust
-use axum::{
-    extract::{ws::{WebSocket, WebSocketUpgrade}, State},
-    response::IntoResponse,
-    routing::get,
-    Router
-};
-use yrs_axum::signaling::{SignalingService, signaling_conn};
-
-#[tokio::main]
-async fn main() {
-  let signaling = SignalingService::new();
-  let app = Router::new()
-      .route("/signaling", get(ws_handler))
-      .with_state(signaling);
-  
-  let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await.unwrap();
-  axum::serve(listener, app).await.unwrap();
-}
-async fn ws_handler(
-  ws: WebSocketUpgrade,
-  State(svc): State<SignalingService>
-) -> impl IntoResponse {
-  ws.on_upgrade(move |socket| peer(socket, svc))
-}
-async fn peer(ws: WebSocket, svc: SignalingService) {
-  match signaling_conn(ws, svc).await {
-    Ok(_) => println!("signaling connection stopped"),
-    Err(e) => eprintln!("signaling connection failed: {}", e),
-  }
-}
-```
-
+[The MIT License](./LICENSE). Port of [yrs-axum](https://github.com/vagmi/yrs-axum),
+which is itself based on [yrs-warp](https://github.com/y-crdt/yrs-warp).
