@@ -93,11 +93,21 @@ impl EngineIoHandler for Handler {
 }
 
 async fn make_group() -> Arc<BroadcastGroup> {
-    let awareness = Arc::new(Awareness::new(Doc::new()));
+    let awareness = Arc::new(yrs_engineio::RwLock::new(Awareness::new(Doc::new())));
     // pending message buffer of up to 64 updates
     Arc::new(BroadcastGroup::new(awareness, 64).await)
 }
 ```
+
+Since yrs 0.27, mutating `Awareness` requires `&mut`, so it is shared as
+`AwarenessRef = Arc<yrs_engineio::RwLock<Awareness>>` (a re-exported
+`parking_lot::RwLock`). `subscribe` applies document messages straight to the
+internally synchronized `Doc` and only takes that lock for awareness messages; use
+`BroadcastGroup::doc()` for server-side document access.
+
+Changes a subscriber sends are tagged with a per-connection transaction origin and are
+not echoed back to it. Awareness states a subscriber announced are removed when it
+disconnects (as y-websocket does), so peers don't keep seeing stale presence.
 
 Mount the handler with `engineioxide::service::EngineIoService` (configuring `req_path`
 to your endpoint) and serve it, e.g. via `axum`'s `route_service`.
@@ -114,7 +124,7 @@ struct EchoProtocol;
 impl Protocol for EchoProtocol {
     fn missing_handle(
         &self,
-        _awareness: &Awareness,
+        _awareness: &mut Awareness,
         tag: u8,
         data: Vec<u8>,
     ) -> Result<Option<Message>, Error> {
